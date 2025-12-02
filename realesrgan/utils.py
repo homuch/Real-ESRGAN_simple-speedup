@@ -262,6 +262,143 @@ class RealESRGANer():
 
         return output, img_mode
 
+    @torch.no_grad()
+    def enhance_batch(self, imgs, outscale=None, alpha_upsampler='realesrgan'):
+        """Enhance a batch of images.
+
+        Args:
+            imgs (List[ndarray]): A list of input images, each is a numpy array in BGR format.
+            outscale (float): The final upsampling scale of the image.
+            alpha_upsampler (str): The upsampler for the alpha channels.
+
+        Returns:
+            list[ndarray]: A list of restored images, each is a numpy array.
+            list[str]: A list of image modes.
+        """
+        if not isinstance(imgs, list):
+            imgs = [imgs]
+
+        # pre-process
+        imgs_processed = []
+        img_modes = []
+        max_ranges = []
+        alphas = []
+        h_inputs, w_inputs = [], []
+
+        for img in imgs:
+            h_input, w_input = img.shape[0:2]
+            h_inputs.append(h_input)
+            w_inputs.append(w_input)
+
+            img = img.astype(np.float32)
+            if np.max(img) > 256:
+                max_range = 65535
+            else:
+                max_range = 255
+            max_ranges.append(max_range)
+            img = img / max_range
+
+            if len(img.shape) == 2:
+                img_mode = 'L'
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            elif img.shape[2] == 4:
+                img_mode = 'RGBA'
+                alpha = img[:, :, 3]
+                img = img[:, :, 0:3]
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                if alpha_upsampler == 'realesrgan':
+                    alpha = cv2.cvtColor(alpha, cv2.COLOR_GRAY2RGB)
+                alphas.append(alpha)
+            else:
+                img_mode = 'RGB'
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                alphas.append(None)
+
+            img_modes.append(img_mode)
+            imgs_processed.append(img)
+
+        # stack images
+        img_tensors = []
+        for img in imgs_processed:
+            img_tensors.append(torch.from_numpy(np.transpose(img, (2, 0, 1))).float())
+
+        self.img = torch.stack(img_tensors, 0)
+        self.img = self.img.to(self.device)
+
+        if self.half:
+            self.img = self.img.half()
+
+        # pre_pad
+        if self.pre_pad != 0:
+            self.img = F.pad(self.img, (0, self.pre_pad, 0, self.pre_pad), 'reflect')
+
+        # mod pad for divisible borders
+        if self.scale == 2:
+            self.mod_scale = 2
+        elif self.scale == 1:
+            self.mod_scale = 4
+        if self.mod_scale is not None:
+            self.mod_pad_h, self.mod_pad_w = 0, 0
+            _, _, h, w = self.img.size()
+            if (h % self.mod_scale != 0):
+                self.mod_pad_h = (self.mod_scale - h % self.mod_scale)
+            if (w % self.mod_scale != 0):
+                self.mod_pad_w = (self.mod_scale - w % self.mod_scale)
+            self.img = F.pad(self.img, (0, self.mod_pad_w, 0, self.mod_pad_h), 'reflect')
+
+        # inference
+        if self.tile_size > 0:
+            self.tile_process()
+        else:
+            self.process()
+
+        # post-process
+        output_img_batch = self.post_process()
+        output_img_batch = output_img_batch.data.float().cpu().clamp_(0, 1).numpy()
+        output_img_batch = np.transpose(output_img_batch, (0, 2, 3, 1))  # B, H, W, C
+
+        # swap channels back to BGR
+        output_img_batch = output_img_batch[:, :, :, [2, 1, 0]]
+
+        # process alpha channel and finalize
+        outputs = []
+        for i in range(len(imgs)):
+            output_img = output_img_batch[i]
+            img_mode = img_modes[i]
+
+            if img_mode == 'L':
+                output_img = cv2.cvtColor(output_img, cv2.COLOR_BGR2GRAY)
+
+            if img_mode == 'RGBA':
+                alpha = alphas[i]
+                if alpha_upsampler == 'realesrgan':
+                    output_alpha, _ = self.enhance(alpha, outscale=self.scale)
+                    output_alpha = cv2.cvtColor(output_alpha, cv2.COLOR_BGR2GRAY)
+                else:
+                    h, w = alpha.shape[0:2]
+                    output_alpha = cv2.resize(alpha, (w * self.scale, h * self.scale), interpolation=cv2.INTER_LINEAR)
+
+                output_img = cv2.cvtColor(output_img, cv2.COLOR_BGR2BGRA)
+                output_img[:, :, 3] = output_alpha
+
+            max_range = max_ranges[i]
+            if max_range == 65535:
+                output = (output_img * 65535.0).round().astype(np.uint16)
+            else:
+                output = (output_img * 255.0).round().astype(np.uint8)
+
+            if outscale is not None and outscale != float(self.scale):
+                h_input, w_input = h_inputs[i], w_inputs[i]
+                output = cv2.resize(
+                    output, (
+                        int(w_input * outscale),
+                        int(h_input * outscale),
+                    ), interpolation=cv2.INTER_LANCZOS4)
+
+            outputs.append(output)
+
+        return outputs, img_modes
+
 
 class PrefetchReader(threading.Thread):
     """Prefetch images.

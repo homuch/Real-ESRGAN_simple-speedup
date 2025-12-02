@@ -1,0 +1,18 @@
+[project]
+name = "real-esrgan"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "basicsr>=1.4.2",
+    "facexlib>=0.2.5",
+    "ffmpeg-python>=0.2.0",
+    "gfpgan>=1.3.5",
+    "numpy>=2.3.5",
+    "opencv-python>=4.11.0.86",
+    "pillow>=12.0.0",
+    "torch>=1.7",
+    "torchvision>=0.24.1",
+    "tqdm>=4.67.1",
+]

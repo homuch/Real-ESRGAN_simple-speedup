@@ -128,6 +128,17 @@ class Reader:
         else:
             return self.get_frame_from_list()
 
+    def get_frames(self, batch_size):
+        frames = []
+        for _ in range(batch_size):
+            frame = self.get_frame()
+            if frame is None:
+                break
+            frames.append(frame)
+        if not frames:
+            return None
+        return frames
+
     def close(self):
         if self.input_type.startswith('video'):
             self.stream_reader.stdin.close()
@@ -164,6 +175,10 @@ class Writer:
     def write_frame(self, frame):
         frame = frame.astype(np.uint8).tobytes()
         self.stream_writer.stdin.write(frame)
+
+    def write_frames(self, frames):
+        for frame in frames:
+            self.write_frame(frame)
 
     def close(self):
         self.stream_writer.stdin.close()
@@ -252,25 +267,30 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
     fps = reader.get_fps()
     writer = Writer(args, audio, height, width, video_save_path, fps)
 
+    if args.face_enhance and args.batch_size > 1:
+        print('Warning: batch_size > 1 is not supported with face_enhance. Setting batch_size to 1.')
+        args.batch_size = 1
+
     pbar = tqdm(total=len(reader), unit='frame', desc='inference')
     while True:
-        img = reader.get_frame()
-        if img is None:
+        imgs = reader.get_frames(args.batch_size)
+        if imgs is None:
             break
 
         try:
             if args.face_enhance:
-                _, _, output = face_enhancer.enhance(img, has_aligned=False, only_center_face=False, paste_back=True)
+                _, _, output = face_enhancer.enhance(imgs[0], has_aligned=False, only_center_face=False, paste_back=True)
+                outputs = [output]
             else:
-                output, _ = upsampler.enhance(img, outscale=args.outscale)
+                outputs, _ = upsampler.enhance_batch(imgs, outscale=args.outscale)
         except RuntimeError as error:
             print('Error', error)
             print('If you encounter CUDA out of memory, try to set --tile with a smaller number.')
         else:
-            writer.write_frame(output)
+            writer.write_frames(outputs)
 
         torch.cuda.synchronize(device)
-        pbar.update(1)
+        pbar.update(len(imgs))
 
     reader.close()
     writer.close()
@@ -358,7 +378,7 @@ def main():
     parser.add_argument('--ffmpeg_bin', type=str, default='ffmpeg', help='The path to ffmpeg')
     parser.add_argument('--extract_frame_first', action='store_true')
     parser.add_argument('--num_process_per_gpu', type=int, default=1)
-
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')
     parser.add_argument(
         '--alpha_upsampler',
         type=str,
