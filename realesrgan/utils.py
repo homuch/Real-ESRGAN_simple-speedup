@@ -7,6 +7,7 @@ import threading
 import torch
 from basicsr.utils.download_util import load_file_from_url
 from torch.nn import functional as F
+import time
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -350,51 +351,53 @@ class RealESRGANer():
         if self.tile_size > 0:
             self.tile_process()
         else:
+            # print("Model start at", time.perf_counter())
             self.process()
+            # print("Model finished at", time.perf_counter())
 
         # post-process
         output_img_batch = self.post_process()
-        output_img_batch = output_img_batch.data.float().cpu().clamp_(0, 1).numpy()
-        output_img_batch = np.transpose(output_img_batch, (0, 2, 3, 1))  # B, H, W, C
+        # print("enhance finished at", time.perf_counter())
+        output_img_batch = output_img_batch.data.detach()#.clamp_(0, 1)
+        
+        # 1. Channel Swap (RGB -> BGR)
+        # We keep the layout as (N, C, H, W) here for the resize operation
+        output_img_batch = output_img_batch[:, [2, 1, 0], :, :] 
 
-        # swap channels back to BGR
-        output_img_batch = output_img_batch[:, :, :, [2, 1, 0]]
+        # 2. Batch Resize (GPU)
+        # Since we assume all images are the same size, we calculate target based on index 0
+        assert all([h_inputs[0]==target_h for target_h in h_inputs])
+        assert all([w_inputs[0]==target_w for target_w in w_inputs])
+        if outscale is not None and outscale != float(self.scale):
+            target_h = int(h_inputs[0] * outscale)
+            target_w = int(w_inputs[0] * outscale)
+            
+            output_img_batch = torch.nn.functional.interpolate(
+                output_img_batch, 
+                size=(target_h, target_w), 
+                mode='bicubic', 
+                antialias=True
+            )
 
-        # process alpha channel and finalize
+        # 3. Permute + Quantize + Transfer
+        # Now we switch to (N, H, W, C) layout
+        output_img_batch = output_img_batch.clamp_(0,1).permute(0, 2, 3, 1)
+        output_img_batch = (output_img_batch * 255.0).round().to(torch.uint8)
+        output_img_batch = output_img_batch.cpu().numpy()
+
         outputs = []
         for i in range(len(imgs)):
-            output_img = output_img_batch[i]
+            # The image is already resized, BGR, and uint8
+            output = output_img_batch[i]
             img_mode = img_modes[i]
 
-            if img_mode == 'L':
-                output_img = cv2.cvtColor(output_img, cv2.COLOR_BGR2GRAY)
-
-            if img_mode == 'RGBA':
-                alpha = alphas[i]
-                if alpha_upsampler == 'realesrgan':
-                    output_alpha, _ = self.enhance(alpha, outscale=self.scale)
-                    output_alpha = cv2.cvtColor(output_alpha, cv2.COLOR_BGR2GRAY)
-                else:
-                    h, w = alpha.shape[0:2]
-                    output_alpha = cv2.resize(alpha, (w * self.scale, h * self.scale), interpolation=cv2.INTER_LINEAR)
-
-                output_img = cv2.cvtColor(output_img, cv2.COLOR_BGR2BGRA)
-                output_img[:, :, 3] = output_alpha
-
+            assert img_mode == 'RGB'
+            
+            # Simplified assertion since we handled scaling/casting in batch above
             max_range = max_ranges[i]
-            if max_range == 65535:
-                output = (output_img * 65535.0).round().astype(np.uint16)
-            else:
-                output = (output_img * 255.0).round().astype(np.uint8)
+            assert max_range == 255
 
-            if outscale is not None and outscale != float(self.scale):
-                h_input, w_input = h_inputs[i], w_inputs[i]
-                output = cv2.resize(
-                    output, (
-                        int(w_input * outscale),
-                        int(h_input * outscale),
-                    ), interpolation=cv2.INTER_LANCZOS4)
-
+            # The loop is now just for appending, no heavy lifting
             outputs.append(output)
 
         return outputs, img_modes

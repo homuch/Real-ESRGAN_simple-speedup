@@ -9,6 +9,7 @@ dependencies = [
     "facexlib>=0.2.5",
     "ffmpeg-python>=0.2.0",
     "gfpgan>=1.3.5",
+    "kornia>=0.8.2",
     "numpy>=2.3.5",
     "opencv-python>=4.11.0.86",
     "pillow>=12.0.0",

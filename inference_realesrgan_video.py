@@ -10,10 +10,13 @@ import torch
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from basicsr.utils.download_util import load_file_from_url
 from os import path as osp
+from queue import Queue
+import threading
 from tqdm import tqdm
 
 from realesrgan import RealESRGANer
 from realesrgan.archs.srvgg_arch import SRVGGNetCompact
+import time
 
 try:
     import ffmpeg
@@ -145,9 +148,12 @@ class Reader:
             self.stream_reader.wait()
 
 
-class Writer:
+class Writer(threading.Thread):
 
-    def __init__(self, args, audio, height, width, video_save_path, fps):
+    def __init__(self, frame_queue, args, audio, height, width, video_save_path, fps):
+        super().__init__()
+        self.frame_queue = frame_queue
+        self.args = args
         out_width, out_height = int(width * args.outscale), int(height * args.outscale)
         if out_height > 2160:
             print('You are generating video that is larger than 4K, which will be very slow due to IO speed.',
@@ -160,7 +166,7 @@ class Writer:
                                  audio,
                                  video_save_path,
                                  pix_fmt='yuv420p',
-                                 vcodec='libx264',
+                                 vcodec=args.video_encoder,
                                  loglevel='error',
                                  acodec='copy').overwrite_output().run_async(
                                      pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
@@ -168,9 +174,23 @@ class Writer:
             self.stream_writer = (
                 ffmpeg.input('pipe:', format='rawvideo', pix_fmt='bgr24', s=f'{out_width}x{out_height}',
                              framerate=fps).output(
-                                 video_save_path, pix_fmt='yuv420p', vcodec='libx264',
+                                 video_save_path,
+                                 pix_fmt='yuv420p',
+                                 vcodec=args.video_encoder,
                                  loglevel='error').overwrite_output().run_async(
                                      pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
+
+    def run(self):
+        while True:
+            frames = self.frame_queue.get()
+            if frames is None:
+                self.close()
+                break
+            try:
+                self.write_frames(frames)
+            except Exception as e:
+                print(f'Error writing frames: {e}')
+                break
 
     def write_frame(self, frame):
         frame = frame.astype(np.uint8).tobytes()
@@ -265,7 +285,10 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
     audio = reader.get_audio()
     height, width = reader.get_resolution()
     fps = reader.get_fps()
-    writer = Writer(args, audio, height, width, video_save_path, fps)
+    # create a queue with a size of approximately 2 seconds of video frames
+    frame_queue = Queue(maxsize=int(round(fps * 2 / args.batch_size)))
+    writer = Writer(frame_queue, args, audio, height, width, video_save_path, fps)
+    writer.start()
 
     if args.face_enhance and args.batch_size > 1:
         print('Warning: batch_size > 1 is not supported with face_enhance. Setting batch_size to 1.')
@@ -273,6 +296,7 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
 
     pbar = tqdm(total=len(reader), unit='frame', desc='inference')
     while True:
+        # print("Getting frames", time.perf_counter())
         imgs = reader.get_frames(args.batch_size)
         if imgs is None:
             break
@@ -287,13 +311,17 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
             print('Error', error)
             print('If you encounter CUDA out of memory, try to set --tile with a smaller number.')
         else:
-            writer.write_frames(outputs)
+            # print("Putting frames", time.perf_counter())
+            frame_queue.put(outputs)
+        # print("finish one loop", time.perf_counter())
 
-        torch.cuda.synchronize(device)
         pbar.update(len(imgs))
 
     reader.close()
-    writer.close()
+    # signal the writer thread to finish
+    frame_queue.put(None)
+    # wait for the writer thread to finish
+    writer.join()
 
 
 def run(args):
@@ -367,6 +395,11 @@ def main():
         help=('Denoise strength. 0 for weak denoise (keep noise), 1 for strong denoise ability. '
               'Only used for the realesr-general-x4v3 model'))
     parser.add_argument('-s', '--outscale', type=float, default=4, help='The final upsampling scale of the image')
+    parser.add_argument(
+        '--video_encoder',
+        type=str,
+        default='libx264',
+        help='The ffmpeg video encoder to use. Examples: libx264, libx265, hevc_nvenc')
     parser.add_argument('--suffix', type=str, default='out', help='Suffix of the restored video')
     parser.add_argument('-t', '--tile', type=int, default=0, help='Tile size, 0 for no tile during testing')
     parser.add_argument('--tile_pad', type=int, default=10, help='Tile padding')
