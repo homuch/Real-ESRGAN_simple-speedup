@@ -8,6 +8,7 @@ import torch
 from basicsr.utils.download_util import load_file_from_url
 from torch.nn import functional as F
 import time
+import torch.backends.cudnn as cudnn
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -74,6 +75,21 @@ class RealESRGANer():
         self.model = model.to(self.device)
         if self.half:
             self.model = self.model.half()
+
+        # [新增] 優化 1: 啟用 cuDNN Benchmark
+        # 這會讓 PyTorch 在啟動時花一點時間尋找最適合你顯卡的卷積算法
+        cudnn.benchmark = True
+
+        # [新增] 優化 2: PyTorch 2.0 編譯模式
+        # 注意：第一次推論會稍微卡住幾秒鐘進行編譯，後面就會變快
+        if hasattr(torch, 'compile'):
+            print("Compiling model with torch.compile for speedup...")
+            # mode='reduce-overhead' 對於小 batch 很有用，但在 Windows 上有時會有 bug
+            # 如果報錯，改用 mode='default' 或不加 mode
+            try:
+                self.model = torch.compile(self.model, mode='reduce-overhead') 
+            except Exception as e:
+                print(f"Compilation failed, falling back to eager mode: {e}")
 
     def dni(self, net_a, net_b, dni_weight, key='params', loc='cpu'):
         """Deep network interpolation.
